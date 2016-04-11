@@ -104,7 +104,7 @@ func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 				err = nil
 				continue
 			}
-			pack.Recycle(nil)
+			pack.Recycle()
 		case <-tickerChan:
 			or.LogMessage(fmt.Sprintf("Ticker fired, uploading payload."))
 			err := so.Upload(buffer, or, false)
