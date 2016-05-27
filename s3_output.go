@@ -1,13 +1,12 @@
 package s3
 
 import (
-	"bufio"
 	"bytes"
+	"compress/gzip"
 	"errors"
 	"fmt"
 	"io"
 	"os"
-	"os/exec"
 	"strings"
 	"time"
 
@@ -21,6 +20,7 @@ const HOUR_TO_TICK int = 00
 const MINUTE_TO_TICK int = 00
 const SECOND_TO_TICK int = 00
 
+// S3OutputConfig holds the config for an S3Output plugin.
 type S3OutputConfig struct {
 	SecretKey        string `toml:"secret_key"`
 	AccessKey        string `toml:"access_key"`
@@ -33,6 +33,7 @@ type S3OutputConfig struct {
 	BufferChunkLimit int    `toml:"buffer_chunk_limit"`
 }
 
+// S3Output is a Heka S3 output plugin.
 type S3Output struct {
 	config         *S3OutputConfig
 	client         *s3.S3
@@ -41,7 +42,7 @@ type S3Output struct {
 }
 
 func midnightTickerUpdate() *time.Ticker {
-	nextTick := time.Date(time.Now().Year(), time.Now().Month(), time.Now().Day(), HOUR_TO_TICK, MINUTE_TO_TICK, SECOND_TO_TICK, 0, time.Local)
+	nextTick := time.Date(time.Now().UTC().Year(), time.Now().UTC().Month(), time.Now().UTC().Day(), HOUR_TO_TICK, MINUTE_TO_TICK, SECOND_TO_TICK, 0, time.UTC)
 	if !nextTick.After(time.Now()) {
 		nextTick = nextTick.Add(INTERVAL_PERIOD)
 	}
@@ -49,10 +50,12 @@ func midnightTickerUpdate() *time.Ticker {
 	return time.NewTicker(diff)
 }
 
+// ConfigStruct provides the default config for a Heka plugin.
 func (so *S3Output) ConfigStruct() interface{} {
 	return &S3OutputConfig{Compression: true, BufferChunkLimit: 1000000}
 }
 
+// Init is the standard Heka plugin initializer.
 func (so *S3Output) Init(config interface{}) (err error) {
 	so.config = config.(*S3OutputConfig)
 	auth, err := aws.GetAuth(so.config.AccessKey, so.config.SecretKey, "", time.Now())
@@ -73,6 +76,7 @@ func (so *S3Output) Init(config interface{}) (err error) {
 	return
 }
 
+// Run is the standard Heka plugin entry point.
 func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 	inChan := or.InChan()
 	tickerChan := or.Ticker()
@@ -101,7 +105,6 @@ func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 			}
 			if err != nil {
 				or.LogMessage(fmt.Sprintf("Warning, unable to write to buffer: %s", err))
-				err = nil
 				continue
 			}
 			pack.Recycle()
@@ -110,7 +113,6 @@ func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 			err := so.Upload(buffer, or, false)
 			if err != nil {
 				or.LogMessage(fmt.Sprintf("Warning, unable to upload payload: %s", err))
-				err = nil
 				continue
 			}
 			or.LogMessage(fmt.Sprintf("Payload uploaded successfully."))
@@ -121,7 +123,6 @@ func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 			err := so.Upload(buffer, or, true)
 			if err != nil {
 				or.LogMessage(fmt.Sprintf("Warning, unable to upload payload: %s", err))
-				err = nil
 				continue
 			}
 			or.LogMessage(fmt.Sprintf("Payload uploaded successfully."))
@@ -133,6 +134,7 @@ func (so *S3Output) Run(or OutputRunner, h PluginHelper) (err error) {
 	return
 }
 
+// WriteToBuffer writes bytes to the buffer and writes the buffer to disk if it exceeds the limit.
 func (so *S3Output) WriteToBuffer(buffer *bytes.Buffer, outBytes []byte, or OutputRunner) (err error) {
 	_, err = buffer.Write(outBytes)
 	if err != nil {
@@ -144,18 +146,19 @@ func (so *S3Output) WriteToBuffer(buffer *bytes.Buffer, outBytes []byte, or Outp
 	return
 }
 
-func (so *S3Output) SaveToDisk(buffer *bytes.Buffer, or OutputRunner) (err error) {
+// SaveToDisk appends the contents of the buffer to disk and resets the buffer.
+func (so *S3Output) SaveToDisk(buffer *bytes.Buffer, or OutputRunner) error {
 	_, err = os.Stat(so.config.BufferPath)
 	if os.IsNotExist(err) {
 		err = os.MkdirAll(so.config.BufferPath, 0666)
 		if err != nil {
-			return
+			return err
 		}
 	}
 
 	err = os.Chdir(so.config.BufferPath)
 	if err != nil {
-		return
+		return err
 	}
 
 	_, err = os.Stat(so.bufferFilePath)
@@ -170,64 +173,42 @@ func (so *S3Output) SaveToDisk(buffer *bytes.Buffer, or OutputRunner) (err error
 
 	f, err := os.OpenFile(so.bufferFilePath, os.O_APPEND|os.O_WRONLY, 0666)
 	if err != nil {
-		return
+		return err
 	}
 	defer f.Close()
 
 	_, err = f.Write(buffer.Bytes())
 	if err != nil {
-		return
+		return err
 	}
 
 	buffer.Reset()
 
-	return
+	return nil
 }
 
+// ReadFromDisk reads and optionally compresses the file from disk and returns a buffer of its contents.
 func (so *S3Output) ReadFromDisk(or OutputRunner) (buffer *bytes.Buffer, err error) {
-	if so.config.Compression {
-		or.LogMessage("Compressing buffer file...")
-		cmd := exec.Command("gzip", so.bufferFilePath)
-		err = cmd.Run()
-		if err != nil {
-			return nil, err
-		}
-		// rename to original filename without .gz extension
-		cmd = exec.Command("mv", so.bufferFilePath+".gz", so.bufferFilePath)
-		err = cmd.Run()
-		if err != nil {
-			return nil, err
-		}
-	}
-
-	or.LogMessage("Uploading, reading from buffer file.")
 	fi, err := os.Open(so.bufferFilePath)
 	if err != nil {
 		return
 	}
 	defer fi.Close()
 
-	r := bufio.NewReader(fi)
-	buffer = bytes.NewBuffer(nil)
-
-	buf := make([]byte, 1024)
-	for {
-		n, err := r.Read(buf)
-		if err != nil && err != io.EOF {
-			break
-		}
-		if n == 0 {
-			break
-		}
-		_, err = buffer.Write(buf[:n])
-		if err != nil {
-			break
-		}
+	if so.config.Compression {
+		or.LogMessage("Reading and compressing buffer file.")
+		w := gzip.NewWriter(buffer)
+		_, err = io.Copy(w, fi)
+		w.Close()
+	} else {
+		or.LogMessage("Reading buffer file.")
+		_, err = io.Copy(buffer, fi)
 	}
 
 	return buffer, err
 }
 
+// Upload flushes any remaining buffer contents to disk and then uploads the file contents to S3.
 func (so *S3Output) Upload(buffer *bytes.Buffer, or OutputRunner, isMidnight bool) (err error) {
 	_, err = os.Stat(so.bufferFilePath)
 	if buffer.Len() == 0 && os.IsNotExist(err) {
@@ -248,16 +229,16 @@ func (so *S3Output) Upload(buffer *bytes.Buffer, or OutputRunner, isMidnight boo
 	}
 
 	var (
-		currentTime = time.Now().Local().Format("20060102150405")
+		currentTime = time.Now().Local().Format("2006-01-02_150405")
 		currentDate = ""
 		ext         = ""
 		contentType = "text/plain"
 	)
 
 	if isMidnight {
-		currentDate = time.Now().Local().AddDate(0, 0, -1).Format("2006-01-02 15:00:00 +0800")[0:10]
+		currentDate = time.Now().UTC().AddDate(0, 0, -1).Format("2006-01-02")
 	} else {
-		currentDate = time.Now().Local().Format("2006-01-02 15:00:00 +0800")[0:10]
+		currentDate = time.Now().UTC().Format("2006-01-02")
 	}
 
 	if so.config.Compression {
@@ -266,7 +247,7 @@ func (so *S3Output) Upload(buffer *bytes.Buffer, or OutputRunner, isMidnight boo
 	}
 
 	path := so.config.Prefix + "/" + currentDate + "/" + currentTime + ext
-	err = so.bucket.Put(path, buffer.Bytes(), contentType, "public-read", s3.Options{})
+	err = so.bucket.Put(path, buffer.Bytes(), contentType, s3.Private, s3.Options{})
 
 	or.LogMessage("Upload finished, removing buffer file on disk.")
 	if err == nil {
