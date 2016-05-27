@@ -195,6 +195,8 @@ func (so *S3Output) ReadFromDisk(or OutputRunner) (buffer *bytes.Buffer, err err
 	}
 	defer fi.Close()
 
+	buffer = new(bytes.Buffer)
+
 	if so.config.Compression {
 		or.LogMessage("Reading and compressing buffer file.")
 		w := gzip.NewWriter(buffer)
