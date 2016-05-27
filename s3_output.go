@@ -148,7 +148,7 @@ func (so *S3Output) WriteToBuffer(buffer *bytes.Buffer, outBytes []byte, or Outp
 
 // SaveToDisk appends the contents of the buffer to disk and resets the buffer.
 func (so *S3Output) SaveToDisk(buffer *bytes.Buffer, or OutputRunner) error {
-	_, err = os.Stat(so.config.BufferPath)
+	_, err := os.Stat(so.config.BufferPath)
 	if os.IsNotExist(err) {
 		err = os.MkdirAll(so.config.BufferPath, 0666)
 		if err != nil {
